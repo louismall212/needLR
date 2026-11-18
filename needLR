@@ -875,16 +875,25 @@ truvari_merge () {
     cat "${output}_truvari_merged_temp.txt" | awk -F '\t' 'BEGIN{OFS="\t"}{nids=split($3,ids,";");$3=ids[1];print $0}' > "${output}_truvari_merged_reduced.tsv"
     cat "${output}_truvari_collapsed_temp.txt" | awk -F '\t' 'BEGIN{OFS="\t"}{nids=split($1,ids,";");$1=ids[1];if($1~/needLR/){print $0}}' > "${output}_truvari_collapsed_reduced.tsv"
 
-    needlrids=( $(cut -f1 "${output}_truvari_collapsed_reduced.tsv" ) )
-    matchids=( $(cut -f3 "${output}_truvari_collapsed_reduced.tsv" ) )
-
+    # One pass with a lookup table instead of one sed -i over the whole merged table per collapsed query SV:
+    # that was quadratic in the number of SVs, its unanchored regex (e.g. "2.0:") also matched inside longer
+    # CollapseIds (e.g. "82612.0:"), and only the first query SV collapsed into a kept SV got its ID added.
+    # The CollapseId (before the ":") is now matched exactly and all collapsed query IDs are added.
     echo "Adding needLR IDs to collapsed variants"
-    for((i=0;i<${#needlrids[@]};i++))
-    do
-        matchid=${matchids[$i]}
-        needlrid=${needlrids[$i]}
-        sed -i "s/${matchid}:/${needlrid},/" "${output}_truvari_merged_reduced.tsv"
-    done
+    awk -F '\t' 'BEGIN { OFS = "\t" }
+        # collapsed SVs: $1 = needLR ID, $3 = MatchId (CollapseId of the SV it was collapsed into)
+        FILENAME == ARGV[1] { ids[$3] = ($3 in ids) ? ids[$3] "," $1 : $1; next }
+        # merged SVs: $3 = "CollapseId:ID"
+        {
+            c = index($3, ":")
+            if (c > 0) {
+                key = substr($3, 1, c - 1)
+                if (key in ids) $3 = ids[key] "," substr($3, c + 1)
+            }
+            print
+        }' "${output}_truvari_collapsed_reduced.tsv" "${output}_truvari_merged_reduced.tsv" \
+        > "${output}_truvari_merged_reduced.tsv.tmp"
+    mv "${output}_truvari_merged_reduced.tsv.tmp" "${output}_truvari_merged_reduced.tsv"
 
     newlines=$( wc -l "${output}_truvari_merged_reduced.tsv" | tr -s ' ' | cut -f1 -d ' ')
     echo "Truvari output has $newlines lines"
@@ -1538,23 +1547,24 @@ printVCF() {
     zgrep  ^##INFO ${output}.sorted.prelift.vcf.gz >> ${finalOutput}.vcf
     zgrep ^#CHROM ${vcf} >> ${finalOutput}.vcf
 
-    varids=( $(zgrep -v ^# $vcf | cut -f3) )
-    newinfolines=()
-    for varid in ${varids[@]}
-    do
-        varline=$(zgrep $varid ${output}.sorted.prelift.vcf.gz || echo "none")
-        if [[ $varline != "none" ]]
-        then
-            infoline=$( echo $varline | cut -d ' ' -f8 )
-        else
-            infoline='needLR_null="none"'
-        fi
-        newinfolines+=( $infoline )
-    done
-
-    paste <( zgrep -v ^# $vcf | cut -f1-7 ) \
-        <( paste <(zgrep -v ^# $vcf | cut -f8) <(echo ${newinfolines[@]} | tr ' ' '\n') | tr '\t' ';' ) \
-        <(zgrep -v ^# $vcf | cut -f9-10) >> ${finalOutput}.vcf
+    # One pass with a lookup table instead of one zgrep over the whole annotated VCF per query SV (quadratic in
+    # the number of SVs). The IDs are matched exactly: zgrep also matched an ID inside a longer ID (needLR.X in
+    # needLR.X1) and failed for ";" separated IDs, of which only the first is kept in the table (truvari_merge).
+    # All sample columns are kept (cut -f9-10 kept only the first sample of a cohort VCF, the header lists all).
+    awk -F '\t' 'BEGIN { OFS = "\t" }
+        # annotated VCF: the ID column holds the needLR ID(s), e.g. "needLR.A,needLR.B,ctrl" or "82561.0:needLR.A"
+        FILENAME == ARGV[1] {
+            if ($0 ~ /^#/) next
+            n = split($3, ids, /[,:]/)
+            for (i = 1; i <= n; i++) if (!(ids[i] in info)) info[ids[i]] = $8   # first record (file order) wins
+            next
+        }
+        # query VCF: look up the first of the ";" separated IDs
+        {
+            split($3, q, ";")
+            $8 = $8 ";" ((q[1] in info) ? info[q[1]] : "needLR_null=\"none\"")
+            print
+        }' <(zcat ${output}.sorted.prelift.vcf.gz) <(zgrep -v ^# $vcf) >> ${finalOutput}.vcf
 
     bgzip ${finalOutput}.vcf
     tabix -p vcf ${finalOutput}.vcf.gz
